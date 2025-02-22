@@ -1,0 +1,919 @@
+---
+title: "Estimation of the Pyrenean brown bear population"
+output:
+  html_document:
+    code_folding: show
+    df_print: paged
+    highlight: tango
+    number_sections: yes
+    theme: united
+    toc: yes
+    toc_depth: 2
+  pdf_document:
+    toc: yes
+    toc_depth: '2'
+date: "Feb 2025"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, cache = TRUE, message = FALSE, warning = FALSE, dpi = 600)
+```
+
+# Motivation
+
+We estimate abundance of the Pyrenean brown bear population with data from France and Spain using robust-design capture-recapture models. We consider data from 2008 to 2024 considering the period May to September. 
+
+A nice introduction to robust design models can be found [here](http://www.phidot.org/software/mark/docs/book/pdf/chap15.pdf). 
+
+Here, we adopt a frequentist approach to explore effects on survival and detection and the temporary emigration structure. Analyses were performed using the `R` package `RMark` ([Laake 2013](http://www.afsc.noaa.gov/Publications/ProcRpt/PR2013-01.pdf)) that allows calling program `Mark` from `R`.
+
+Load a few packages we will need. 
+```{r}
+library(tidyverse)
+theme_set(theme_light(base_size=16))
+library(lubridate)
+library(zoo)
+library(RMark) 
+library(R2jags)
+```
+
+# Data preparation
+
+Read in the data and inspect them:
+```{r}
+rawdata <- read_csv2("databaseCMR2025.csv", col_names = FALSE)
+rawdata
+```
+
+The columns have no name, we're gonna add some. Let's start by the obvious ones:
+```{r}
+dataprocessed <- rawdata %>%
+  rename(id = 'X1',
+         sex = 'X2',
+         birth_year = 'X3',
+         first_capture = 'X4',
+         age_first_capture = 'X5')
+dataprocessed
+```
+
+Now we need the dates to name the remaining columns:
+```{r}
+dates <- seq(from = as.Date("2008/5/1"), to = as.Date("2024/9/1"), by = "month") %>% 
+  enframe(name = NULL) %>% # make it a tibble
+  rename(date = value) %>% # rename column
+  mutate(month = month(date),
+         year = year(date)) %>% # select month and year
+  filter(month %in% c(5,6,7,8,9)) # filter May -> September
+dates
+```
+
+Rename the columns, at last:
+```{r}
+dataprocessed <- dataprocessed %>% 
+  rename_at(vars(starts_with('X')), ~paste0(dates$month, '/', dates$year)) %>%
+  mutate(id = as_factor(id),
+         sex = as_factor(sex))
+dataprocessed
+```
+
+# Data exploration
+
+First, we tidy the data:
+```{r}
+tidydata <- dataprocessed %>% 
+  pivot_longer(-c(id,sex,birth_year,first_capture,age_first_capture), names_to = 'date', values_to = '(non-)detections')
+tidydata
+```
+
+Now we may compute the number of detections per occasion:
+```{r}
+tidydata %>% 
+  mutate(date = as.Date(as.yearmon(date, "%m/%Y")),
+         month = month(date),
+         year = year(date)) %>%
+  group_by(year,month) %>%
+  summarise(emr = sum(`(non-)detections`)) %>%
+  ggplot() + 
+  geom_col(aes(x = as_factor(year), y = emr, fill = as_factor(month))) +
+  scale_fill_viridis_d(name = 'month') + 
+  labs(x = 'year', y = "number of detections") +
+  coord_flip() + 
+  theme(legend.position = "bottom")
+```
+
+How many individuals have been identified:
+```{r}
+tidydata %>% 
+  pivot_wider(names_from = date, values_from = '(non-)detections') %>%
+  pull(id) %>%
+  length()
+```
+
+How many males, females and individuals of unknown sex do we have:
+```{r}
+tidydata %>% 
+  pivot_wider(names_from = date, values_from = '(non-)detections') %>%
+  count(sex)
+```
+
+# Formating data for capture-recapture analyses
+
+To format the data for capture-recapture analyses, we first double-check whether all individuals have at least a detection: 
+```{r}
+dataprocessed <- dataprocessed %>%
+  mutate(sum = rowSums(across(contains("20"))), .before = id) %>%
+  filter(sum > 0)
+```
+
+
+We need to paste the columns of (non-)detections altogether, which can be achieved as follows: 
+```{r}
+ch <- dataprocessed %>%
+  select(-c(sum, id,sex,birth_year,first_capture,age_first_capture)) %>%
+  unite(col = 'ch', sep= '')
+ch
+```
+
+We now define the structure of the robust design. We have 16 primary occasions (the years, from 2008 to 2024) and 5 secondary occasions (from May to September). From the help file (see ?robust), we read that 'The 0 time intervals represent the secondary sessions in which the population is assumed to be closed. The non-zero values are the time intervals between the primary occasions.'. We therefore write:
+```{r}
+time.intervals <- c(0,0,0,0,1, # 2008
+                    0,0,0,0,1, # 2009
+                    0,0,0,0,1, # 2010
+                    0,0,0,0,1, # 2011
+                    0,0,0,0,1, # 2012
+                    0,0,0,0,1, # 2013
+                    0,0,0,0,1, # 2014
+                    0,0,0,0,1, # 2015
+                    0,0,0,0,1, # 2016
+                    0,0,0,0,1, # 2017
+                    0,0,0,0,1, # 2018
+                    0,0,0,0,1, # 2019
+                    0,0,0,0,1, # 2020
+                    0,0,0,0,1, # 2021
+                    0,0,0,0,1, # 2022
+                    0,0,0,0,1, # 2023
+                    0,0,0,0)   # 2024
+```
+
+Because we want to have age effects on survival, we need to create an age variable bearing in mind that we have age at first capture. Cubs (< 2 year old) are coded 1, subadults are coded 2 (2 or 3 years old) and adults 3 (> 3 years old):
+```{r}
+ageclass <- dataprocessed %>% 
+  mutate(aged = case_when(
+    age_first_capture < 2 ~ '1', 
+    age_first_capture == 2 | age_first_capture == 3 ~ '2', 
+    age_first_capture > 3 ~ '3')) %>%
+  pull(aged) %>%
+  as_factor() %>%
+  fct_inseq() # reorder factor by numeric value of level
+ageclass
+```
+
+For individuals named `Balou`, `Bercero2013`, `Cachou`, `Gribouille`, `Melloux`, `New20_01`, `New20_12`, `S28Slo3`, `ourson_Caramellita_2020_2` and `ourson_Caramellita_2020_3` we know the date of death, let's use this information and right censor them. First, locate them:
+```{r}
+dataprocessed %>%
+  mutate(id = as.character(id)) %>%
+  pull(id) -> id
+
+mask <- which(id %in% c("Balou", 
+              "Bercero2013", 
+              "Cachou", 
+              "Gribouille", 
+              "Melloux", 
+              "New20_01", 
+              "New20_12",
+              "S28Slo3", 
+              "ourson_Caramellita_2020_2",
+              "ourson_Caramellita_2020_3"))
+```
+
+```{r}
+freq <- rep(1, nrow(dataprocessed))
+freq[mask] <- -1
+```
+
+Now put together the encounter histories and age class
+```{r}
+brownbear <- data.frame(ch = ch, 
+                        freq = freq, 
+                        age = ageclass)
+brownbear
+```
+
+Initialize the number of capture occasions, the time intervals and create an age structure, for both standard robust design and robust design with heterogeneity:
+```{r}
+# standard RD
+bear.process <- process.data(brownbear, 
+                             model = "Robust", # standard robust design
+                             time.intervals = time.intervals, # primary/secondary occasions
+                             groups = "age",
+                             initial.age = c(0,2,4), # specifies age at first capture for each age class
+                             begin.time = 2008)
+# RD with heterogeneity
+bear.process.mix <- process.data(brownbear, 
+                             model = "RDHet", # robust design with heterogeneity
+                             time.intervals = time.intervals, # primary/secondary occasions
+                             groups = "age",
+                             initial.age = c(0,2,4), # specifies age at first capture for each age class
+                             begin.time = 2008)
+```
+
+Create design matrix:
+```{r}
+bear.ddl <- make.design.data(bear.process)
+bear.ddl.mix <- make.design.data(bear.process.mix)
+```
+
+Create a binned age variable in the design matrix (see, e.g., [here](http://www.phidot.org/forum/viewtopic.php?f=21&t=2591)):
+```{r}
+bear.ddl <- add.design.data(bear.process, 
+                            bear.ddl, 
+                            parameter = "S",
+                            type = "age", 
+                            bins = c(0, 2, 4, 23), 
+                            name = "ageclass", 
+                            right = FALSE, # to get an interval closed on the left and open on the right
+                            replace = TRUE)
+# compare bear.ddl$S$age with bear.ddl$S$ageclass
+
+bear.ddl.mix <- add.design.data(bear.process.mix, 
+                            bear.ddl.mix, 
+                            parameter = "S",
+                            type = "age", 
+                            bins = c(0, 2, 4, 23), 
+                            name = "ageclass", 
+                            right = FALSE, # to get an interval closed on the left and open on the right
+                            replace = TRUE)
+
+```
+
+Last, specify structure on parameters, namely we consider survival constant or age-dependent, detection constant, time-dependent (we consider variation between primary occasions and within primary occasions) or heterogeneous, and emigration Markovian, random or no emigration:
+```{r}
+S <- list(formula=~1) # survival is constant
+S.age <- list(formula=~ageclass) # survival is age-dependent (3 age classes)
+p <- list(formula=~1, share = TRUE) # detection is constant, share = TRUE is to force c and p to share same columns
+p.time <- list(formula=~time, share = TRUE) # detection is time-varying where time is the occasions within primary occasions
+p.session <- list(formula=~session, share = TRUE) # detection is time-varying where session is the primary occasion
+p.mix <- list(formula=~mixture, share = TRUE) # detection is heterogeneous
+GammaPrimeNE <- list(formula=~1, fixed = 0) # gamma' = gamma'' = 0, no emigration
+GammaDoublePrimeNE <- list(formula=~1,fixed=0) # gamma' = gamma'' = 0, no emigration
+GammaDoublePrimeMK <- list(formula=~1) # Markovian emigration
+GammaPrimeMK <- list(formula=~1) # Markovian emigration
+GammaDoublePrimeAL <- list(formula=~1, share = TRUE) # gamma' = gamma'', random emigration
+```
+
+# Robust-design capture-recapture analyses
+
+Before starting the analyses, it doesn't hurt to have a look to the relevant help file: 
+```{r}
+?robust
+```
+
+Now let's fit a bunch of models.
+
+## No emigration
+
+```{r}
+modelSp_noemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S,
+                                       GammaPrime = GammaPrimeNE,
+                                       GammaDoublePrime = GammaDoublePrimeNE,
+                                       p = p),
+                 threads = 2,
+                 output = FALSE)
+
+modelSpt_noemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S,
+                                       GammaPrime = GammaPrimeNE,
+                                       GammaDoublePrime = GammaDoublePrimeNE,
+                                       p = p.time),
+                 threads = 2,
+                 output = FALSE)
+
+modelSpprimary_noemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S,
+                                       GammaPrime = GammaPrimeNE,
+                                       GammaDoublePrime = GammaDoublePrimeNE,
+                                       p = p.session),
+                 threads = 2,
+                 output = FALSE)
+
+modelSph_noemig <- mark(bear.process.mix, 
+                 bear.ddl.mix, 
+                 model.parameters=list(S = S,
+                                       GammaPrime = GammaPrimeNE,
+                                       GammaDoublePrime = GammaDoublePrimeNE,
+                                       p = p.mix),
+                 threads = 2,
+                 output = FALSE)
+
+modelSap_noemig <- mark(bear.process, 
+                bear.ddl, 
+                model.parameters=list(S = S.age,
+                                       GammaPrime = GammaPrimeNE,
+                                       GammaDoublePrime = GammaDoublePrimeNE,
+                                      p = p),
+                 threads = 2,
+                 output = FALSE)
+
+modelSapt_noemig <- mark(bear.process, 
+                bear.ddl, 
+                model.parameters=list(S = S.age,
+                                       GammaPrime = GammaPrimeNE,
+                                       GammaDoublePrime = GammaDoublePrimeNE,
+                                      p = p.time),
+                 threads = 2,
+                 output = FALSE)
+
+modelSapprimary_noemig <- mark(bear.process, 
+                bear.ddl, 
+                model.parameters=list(S = S.age,
+                                       GammaPrime = GammaPrimeNE,
+                                       GammaDoublePrime = GammaDoublePrimeNE,
+                                      p = p.session),
+                 threads = 2,
+                 output = FALSE)
+
+modelSaph_noemig <- mark(bear.process.mix, 
+                bear.ddl.mix, 
+                model.parameters=list(S = S.age,
+                                       GammaPrime = GammaPrimeNE,
+                                       GammaDoublePrime = GammaDoublePrimeNE,
+                                      p = p.mix),
+                 threads = 2,
+                 output = FALSE)
+```
+
+## Markovian emigration
+
+```{r}
+modelSp_mkemig <- mark(bear.process, 
+                bear.ddl, 
+                model.parameters=list(S = S,
+                                      GammaPrime = GammaPrimeMK,
+                                      GammaDoublePrime = GammaDoublePrimeMK,
+                                      p = p),
+                 threads = 2,
+                 output = FALSE)
+
+modelSpt_mkemig <- mark(bear.process, 
+                bear.ddl, 
+                model.parameters=list(S=S,
+                                      GammaPrime = GammaPrimeMK,
+                                      GammaDoublePrime = GammaDoublePrimeMK,
+                                      p=p.time),
+                 threads = 2,
+                 output = FALSE)
+
+modelSpprimary_mkemig <- mark(bear.process, 
+                bear.ddl, 
+                model.parameters=list(S=S,
+                                      GammaPrime = GammaPrimeMK,
+                                      GammaDoublePrime = GammaDoublePrimeMK,
+                                      p=p.session),
+                 threads = 2,
+                 output = FALSE)
+
+modelSph_mkemig <- mark(bear.process.mix, 
+                bear.ddl.mix, 
+                model.parameters=list(S=S,
+                                      GammaPrime = GammaPrimeMK,
+                                      GammaDoublePrime = GammaDoublePrimeMK,
+                                      p = p.mix),
+                 threads = 2,
+                 output = FALSE)
+
+modelSap_mkemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S.age,
+                                       GammaPrime = GammaPrimeMK,
+                                       GammaDoublePrime = GammaDoublePrimeMK,
+                                       p = p),
+                 threads = 2,
+                 output = FALSE)
+
+modelSapt_mkemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S.age,
+                                       GammaPrime = GammaPrimeMK,
+                                       GammaDoublePrime = GammaDoublePrimeMK,
+                                       p = p.time),
+                 threads = 2,
+                 output = FALSE)
+
+modelSapprimary_mkemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S.age,
+                                       GammaPrime = GammaPrimeMK,
+                                       GammaDoublePrime = GammaDoublePrimeMK,
+                                       p = p.session),
+                 threads = 2,
+                 output = FALSE)
+
+modelSaph_mkemig <- mark(bear.process.mix, 
+                 bear.ddl.mix, 
+                 model.parameters=list(S = S.age,
+                                       GammaPrime = GammaPrimeMK,
+                                       GammaDoublePrime = GammaDoublePrimeMK,
+                                       p = p.mix),
+                 threads = 2,
+                 output = FALSE)
+```
+
+## Random emigration
+
+```{r}
+modelSp_rdemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S,
+                                       GammaDoublePrime = GammaDoublePrimeAL,
+                                       p = p),
+                 threads = 2,
+                 output = FALSE)
+
+modelSpt_rdemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S,
+                                       GammaDoublePrime = GammaDoublePrimeAL,
+                                       p = p.time),
+                 threads = 2,
+                 output = FALSE)
+
+modelSpprimary_rdemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S,
+                                       GammaDoublePrime = GammaDoublePrimeAL,
+                                       p = p.session),
+                 threads = 2,
+                 output = FALSE)
+
+modelSph_rdemig <- mark(bear.process.mix, 
+                 bear.ddl.mix, 
+                 model.parameters=list(S = S,
+                                       GammaDoublePrime = GammaDoublePrimeAL,
+                                       p = p.mix),
+                 threads = 2,
+                 output = FALSE)
+
+modelSap_rdemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S.age,
+                                       GammaDoublePrime = GammaDoublePrimeAL,
+                                       p = p),
+                 threads = 2,
+                 output = FALSE)
+
+modelSapt_rdemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S.age,
+                                       GammaDoublePrime = GammaDoublePrimeAL,
+                                       p = p.time),
+                 threads = 2,
+                 output = FALSE)
+
+modelSapprimary_rdemig <- mark(bear.process, 
+                 bear.ddl, 
+                 model.parameters=list(S = S.age,
+                                       GammaDoublePrime = GammaDoublePrimeAL,
+                                       p = p.session),
+                 threads = 2,
+                 output = FALSE)
+
+modelSaph_rdemig <- mark(bear.process.mix, 
+                 bear.ddl.mix, 
+                 model.parameters=list(S = S.age,
+                                       GammaDoublePrime = GammaDoublePrimeAL,
+                                       p = p.mix),
+                 threads = 2,
+                 output = FALSE)
+```
+
+## Model selection
+
+Next step is to try and make sense of the models we fitted. We first collect them all:
+```{r}
+name_models <- c('modelSp_noemig',
+'modelSpt_noemig',
+'modelSpprimary_noemig',
+'modelSph_noemig',
+'modelSap_noemig',
+'modelSapt_noemig',
+'modelSapprimary_noemig',
+'modelSaph_noemig',
+'modelSp_mkemig',
+'modelSpt_mkemig',
+'modelSpprimary_mkemig',
+'modelSph_mkemig',
+'modelSap_mkemig',
+'modelSapt_mkemig',
+'modelSapprimary_mkemig',
+'modelSaph_mkemig',
+'modelSp_rdemig',
+'modelSpt_rdemig',
+'modelSpprimary_rdemig',
+'modelSph_rdemig',
+'modelSap_rdemig',
+'modelSapt_rdemig',
+'modelSapprimary_rdemig',
+'modelSaph_rdemig')
+AICcvalues <- rep(NA, length(name_models))
+AICcvalues[1] <- eval(parse(text = paste0(name_models[1],'$results$AICc')))
+for (i in 2:length(name_models)){
+  AICcvalues[i] <- eval(parse(text = paste0(name_models[i],'$results$AICc')))
+}
+ord <- order(AICcvalues)
+model_table <- data.frame(model = name_models[ord], AICc = AICcvalues[ord])
+model_table
+```
+
+We fitted 24 models in total, with 4 detection structures, 2 survival structures and 3 emigration structures. It appears that the models with age-dependent survival and heterogeneous detection are best supported by the data. There is emigration, and it is Markovian. Same results as last year by the way. There is no need to carry out model averaging because the AICc of the top model is lower than the other models. 
+
+Let's inspect the parameter estimates of the best model:
+```{r}
+modelSaph_mkemig$results$real[1:8,]
+```
+
+Survival of cubs is around $81\%$, survival of subadults is $95\%$, and that of adults is $96\%$. Regarding the observation process, we have a mixture of lowly and highly detectable individuals. More precisely, we have a proportion $0.80$ of individuals with detection $44\%$ and a proportion $0.20$ of individuals with detection $89\%$.
+
+Clean up:
+```{r}
+cleanup(ask = FALSE)
+```
+
+# Population size
+
+## Formating data for capture-recapture analyses
+
+Read again and format raw data. 
+
+```{r}
+rawdata <- read_csv2("databaseCMR2025.csv", col_names = FALSE)
+dataprocessed <- rawdata %>%
+  rename(id = 'X1',
+         sex = 'X2',
+         birth_year = 'X3',
+         first_capture = 'X4',
+         age_first_capture = 'X5') %>%
+  mutate(sum = rowSums(across(starts_with("X"))), .before = id) %>%
+  filter(sum > 0) %>%
+  select(-sum)
+dates <- seq(from = as.Date("2008/5/1"), to = as.Date("2024/9/1"), by = "month") %>% 
+  enframe(name = NULL) %>% # make it a tibble
+  rename(date = value) %>% # rename column
+  mutate(month = month(date),
+         year = year(date)) %>% # select month and year
+  filter(month %in% c(5,6,7,8,9)) # filter May -> September
+brownbear <- dataprocessed %>% 
+  rename_at(vars(starts_with('X')), ~paste0(dates$month, '/', dates$year)) %>%
+  mutate(id = as_factor(id),
+         sex = as_factor(sex))
+n.ind <- nrow(brownbear) # number of individuals
+freq <- rep(1, n.ind)
+brownbear %>%
+  mutate(id = as.character(id)) %>%
+  pull(id) -> id
+mask <- which(id %in% c("Balou", 
+              "Bercero2013", 
+              "Cachou", 
+              "Gribouille", 
+              "Melloux", 
+              "New20_01", 
+              "New20_12", 
+              "S28Slo3", 
+              "ourson_Caramellita_2020_2",
+              "ourson_Caramellita_2020_3"))
+```
+
+We compute several quantities that we will need:
+```{r}
+n.primary <- 17 # number of primary occasions
+n.secondary <- rep(5, n.primary) # number of secondary occasions per primary occasion
+index <- list(1:5,
+              6:10,
+              11:15,
+              16:20,
+              21:25,
+              26:30,
+              31:35,
+              36:40,
+              41:45,
+              46:50,
+              51:55,
+              56:60,
+              61:65,
+              66:70,
+              71:75,
+              76:80,
+              81:85) # the secondary occasions
+```
+
+We calculate the number of individuals caught in each primary occasion, which we will need to get an estimate of population size:
+```{r}
+encounter <- brownbear %>% 
+  select(-c(id, sex, birth_year, first_capture, age_first_capture)) %>%
+  as.matrix()
+caught <- rep(NA, n.primary)
+for (i in 1:n.primary){
+  tmp <- encounter[,index[[i]]]
+  caught[i] <- nrow(tmp[rowSums(tmp)!=0,])
+}
+caught
+```
+
+We format the data as an array with dimensions the number of individuals times the number of primary occasions times the number of secondary occasions: 
+```{r}
+obs <- array(NA, dim = c(n.ind, n.primary, max(n.secondary)))
+for (i in 1:n.primary){
+    obs[,i,1:n.secondary[i]] <- encounter[,index[[i]]]
+}
+dim(obs)
+```
+
+Now we format the data as required in the Bayesian implementation of the robust design:
+```{r}
+ch <- matrix(NA, n.ind, n.primary)
+for (i in 1:n.ind){
+  for (t in 1:n.primary){
+    ifelse(any(obs[i,t,1:n.secondary[t]] == 1), ch[i,t] <- 1, ch[i,t] <- 2)
+  }
+}
+```
+
+Get first occasion of capture for each individual:
+```{r}
+get.first <- function(x)min(which (x != 2))
+first <- apply(ch,1,get.first)
+first[first == "Inf"] <- NA
+```
+
+Get last occasion of capture for each individual:
+```{r}
+#ch[mask,]
+last <- rep(ncol(ch), nrow(ch))
+last[mask] <- c(7, 6, 12, 13, 11, 13, 15, 9, 13, 13)
+```
+
+Build an age matrix to be applied on survival:
+```{r}
+age <- matrix(NA, nrow = n.ind, ncol = n.primary - 1)
+agefirst <- brownbear$age_first_capture
+for (i in 1:n.ind){
+  tmp <- agefirst[i]
+  for (t in wrapr::seqi(first[i],n.primary-1)){
+    age[i,t] <- tmp
+    tmp <- tmp + 1
+      } #t 
+   } #i
+ageclass <- age
+ageclass[age == 0 | age == 1] <- 1 
+ageclass[age == 2 | age == 3] <- 2 
+ageclass[age > 3] <- 3
+head(ageclass)
+```
+
+```{r}
+test <- matrix(NA, n.ind, n.primary)
+for (i in 1:nrow(test)){
+  for (j in 1:ncol(test)){
+    test[i,j] <- sum(obs[i,j,], na.rm = TRUE)
+  }
+}
+
+seen <- array(NA, c(n.ind, n.primary, max(n.secondary)))
+missed <- array(NA, c(n.ind, n.primary, max(n.secondary)))
+
+for (i in 1:nrow(test)){
+  for (t in 1:ncol(test)){
+    for (j in 1:n.secondary[t]){
+      if(test[i,t] > 1 & obs[i,t,j] == 1){seen[i,t,j] <- 1}
+      if(test[i,t] >= 1 & obs[i,t,j] == 0){missed[i,t,j] <- 1}
+    }
+  }
+}
+
+yes <- matrix(NA, n.primary, max(n.secondary))
+no <- matrix(NA, n.primary, max(n.secondary))
+
+for (i in 1:nrow(yes)){
+  for (j in 1:ncol(yes)){
+    yes[i,j] <- sum(seen[,i,j], na.rm = TRUE)
+    no[i,j] <- sum(missed[,i,j], na.rm = TRUE)
+  }
+}
+
+total <- yes + no
+total
+```
+
+Cut individuals released in last primary occasion:
+```{r}
+cut <- which(first != n.primary)
+ch <- ch[c(cut),]
+first <- first[c(cut)]
+ageclass <- ageclass[c(cut),]
+last <- last[c(cut)]
+```
+
+## Model fitting
+
+We consider a capture-recapture model with robust design in which temporary emigration is Markovian, survival is age-dependent survival and there is heterogeneity in the detection process (2-class finite mixture). This is the model best supported by the data, see part 1 of our analyses. We also right censored individuals for which date of death is known.
+
+The code:
+```{r}
+model <- function() {
+  
+    # priors
+    for (i in 1:n.ind){
+      for (t in first[i]:(n.years - 1)){
+        phi[i,t] <- beta[age[i,t]]     # survival  
+      }
+    }
+    for (u in 1:3){
+      beta[u] ~ dunif(0, 1)              # Priors for age-specific survival
+    }
+    gP ~ dunif(0,1)      # gamma'
+    gPP ~ dunif(0,1)     # gamma'' 
+    gamP <- 1 - gP       # MARK parameterization
+    gamPP <- 1 - gPP     # MARK parameterization
+    mu0[1] ~ dunif(0,1)
+    mu0[2] ~ dunif(0,1)
+    mu[1:2] <- sort(mu0) # to handle label switching issue
+    prop ~ ddirich(alpha)
+
+    # secondary occasions p's
+    for (i in 1:n.ind){
+      eta[i] ~ dcat(prop[]) # indicator of whether you belong to class 1 or 2
+      for (t in 1:n.years){
+        for (j in 1:max(n.sec[1:n.years])){
+           p[i,t,j] <- mu[eta[i]] # detection is either mu1 or mu2
+        }
+      }
+    }
+
+    # primary occasions p's or pooled detection probability
+    for (i in 1:n.ind){
+      for (t in 1:n.years){
+        upstar[i,t] <- 1 - prod(1 - p[i,t,1:n.sec[t]])
+      }
+    }
+    
+    # averaged detection over individuals
+    for (t in 1:n.years){
+      pstar[t] <- mean(upstar[1:n.ind,t]) 
+    }
+
+    for (t in 1:n.years){
+      for (j in 1:n.sec[t]){
+        pmean[t,j] <- mean(p[1:n.ind,t,j])
+        yes[t,j] ~ dbin(pmean[t,j], total[t,j])
+      }
+    }  
+
+     # state matrices
+    for (i in 1:n.ind){
+      for (j in first[i]:(n.years - 1)){
+        s[i,j,1,1] <- phi[i,j] * gPP
+        s[i,j,1,2] <- phi[i,j] * (1 - gPP)
+        s[i,j,1,3] <- 1 - phi[i,j]
+        s[i,j,2,1] <- phi[i,j] * gP
+        s[i,j,2,2] <- phi[i,j] * (1 - gP)
+        s[i,j,2,3] <- 1 - phi[i,j]
+        s[i,j,3,1] <- 0
+        s[i,j,3,2] <- 0
+        s[i,j,3,3] <- 1
+      }
+    }
+    
+    # observation matrices
+    for (i in 1:n.ind){
+      for (t in 1:n.years){
+        o[i,t,1,1] <- upstar[i,t]
+        o[i,t,1,2] <- 1 - upstar[i,t]
+        o[i,t,2,1] <- 0
+        o[i,t,2,2] <- 1
+        o[i,t,3,1] <- 0
+        o[i,t,3,2] <- 1
+      }
+    }
+    
+    # likelihood
+    for (i in 1:n.ind){
+      z[i,first[i]] <- ch[i,first[i]]
+      for (t in (first[i]+1):last[i]){
+        z[i,t] ~ dcat(s[i,t-1,z[i,t-1],1:3])   # state equations
+        ch[i,t] ~ dcat(o[i,t,z[i,t],1:2])    # observation equations
+      } 
+    }
+}
+```
+
+The data
+```{r}
+dat <- list(first = first, 
+            last = last,
+            ch = ch, 
+            n.sec = n.secondary, 
+            n.years = ncol(ch), 
+            n.ind = nrow(ch),
+            yes = yes, 
+            total = total,
+            age = ageclass,
+            alpha = c(1,1))
+```
+
+Then initial values, parameters to monitor, MCMC settings:
+```{r}
+# initial values for the latent states:
+z.init <- matrix(NA, nrow(ch), ncol(ch))
+for (i in 1:nrow(ch)){
+  if(first[i] < last[i]){
+    z.init[i,(first[i] + 1):last[i]] <- 1
+  }
+}
+inits <- function(){list(z = z.init)}  
+# parameters
+#pars <- c('pstar','mean.p','beta','gamma','sdeps')
+pars <- c('pstar','mu','beta','gamP','gamPP','prop')
+n.chains <- 3
+n.iter <- 20000
+n.burnin <- 5000
+```
+
+We are ready to fit the model to the data:
+```{r}
+res_markov <- jags(data = dat, 
+                   inits = inits, 
+                   parameters.to.save = pars,
+                   model.file = model, 
+                   n.chains = n.chains,
+                   n.iter = n.iter, 
+                   n.burnin = n.burnin)
+```
+
+Posterior density distribution of the parameters:
+```{r out.width = "100%"}
+jagsfit.mcmc <- as.mcmc(res_markov)
+library(lattice)
+densityplot(jagsfit.mcmc)
+```
+
+Display the results:
+```{r}
+summary(jagsfit.mcmc)
+```
+
+## Get abundance
+
+Provide posterior means for population size:
+```{r}
+Nmcmc <- matrix(NA, nrow(res_markov$BUGSoutput$sims.list$pstar), n.primary)
+for (i in 1:n.primary){
+  Nmcmc[,i] <- caught[i] / res_markov$BUGSoutput$sims.list$pstar[,i]
+}
+Nmean <- apply(Nmcmc,2,mean)
+N25 <- apply(Nmcmc,2,quantile,probs = 2.5/100)
+N975 <- apply(Nmcmc,2,quantile,probs = 97.5/100)
+```
+
+Now compare the estimates with credible intervals to the counts with no correction for imperfect detection:
+```{r}
+res <- data.frame(year = 2008:2024,
+           Nhat = Nmean,
+           lwr = N25,
+           upr = N975,
+           counts = caught)
+res
+```
+
+The abundance estimates are higher than the naive counts, which is what we expect as we correct for imperfect detection and individual heterogeneity in it (e.g. [Cubaynes et al. 2010](https://oliviergimenez.github.io/pubs/Cubaynesetal2010.pdf)). 
+
+Visually, we obtain: 
+```{r}
+res %>%
+  ggplot(aes(year, Nhat)) +  
+  geom_point(color = 'firebrick', size = 2) +
+  geom_line(color = 'firebrick', size = 0.5) +
+  geom_ribbon(aes(ymin = lwr,
+                  ymax = upr),
+              alpha=0.3) +
+  scale_x_continuous(breaks = 2008:2024,
+                     labels = 2008:2024) + 
+  scale_y_continuous(breaks = seq(0,100,by=5),
+                     labels = seq(0,100,by=5)) + 
+  ylab("Estimated abundance") + 
+  xlab("Year") + 
+  labs(
+      title = 'Estimated abundance of Pyrenean brown bear',
+      subtitle = 'w/ a Bayesian robust design capture-recapture model')
+```
+
+
+# R version
+
+```{r}
+sessionInfo()
+```
+
+
